@@ -7,6 +7,7 @@ from pyrogram.errors import FloodWait
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, ChatAdminRequired, UsernameInvalid, UsernameNotModified
 from info import ADMINS, CHANNELS, INDEX_REQ_CHANNEL as LOG_CHANNEL
 from database.ia_filterdb import save_file
+from database.users_chats_db import db
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from utils import temp, get_readable_time
 from math import ceil
@@ -219,8 +220,40 @@ async def set_skip_number(bot, message):
             return await message.reply("Skip number should be an integer.")
         await message.reply(f"Successfully set SKIP number as {skip}")
         temp.CURRENT = int(skip)
+        temp.FORCE_SKIP = True  # is baar saved progress ki jagah ye skip number chalega
     else:
         await message.reply("Give me a skip number")
+ 
+# ---------------------------------------------------------------------------
+# Resume support: har channel ka "last indexed message ID" database mein save hota hai.
+# Agli baar /index (ya link/forward se index) wahin se shuru hoga, shuru se nahi.
+# ---------------------------------------------------------------------------
+async def get_last_indexed(chat):
+    try:
+        doc = await db.db.index_progress.find_one({"_id": str(chat)})
+        return int(doc["last_id"]) if doc else 0
+    except Exception as e:
+        logger.exception(e)
+        return 0
+ 
+ 
+async def set_last_indexed(chat, last_id):
+    try:
+        await db.db.index_progress.update_one(
+            {"_id": str(chat)}, {"$set": {"last_id": int(last_id)}}, upsert=True
+        )
+    except Exception as e:
+        logger.exception(e)
+ 
+ 
+@Client.on_message(filters.command("resetindex") & filters.private & filters.user(ADMINS))
+async def reset_index_progress(bot, message):
+    """/resetindex <chat_id>  -> us channel ko dobara shuru se index karne ke liye."""
+    if len(message.command) < 2:
+        return await message.reply("Aise likho: <code>/resetindex -1001234567890</code>")
+    await db.db.index_progress.delete_one({"_id": message.command[1].lstrip("@")})
+    await message.reply("Done. Agla /index is channel ko shuru se scan karega.")
+ 
  
 def get_progress_bar(percent, length=10):
     """Creates an emoji-based progress bar."""
@@ -240,17 +273,25 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
  
     async with lock:
         try:
-            current = temp.CURRENT
+            if getattr(temp, "FORCE_SKIP", False):
+                current = temp.CURRENT      # /setskip se manual start
+                temp.FORCE_SKIP = False
+            else:
+                saved = await get_last_indexed(chat)
+                current = saved if saved else temp.CURRENT
+            start_point = current
+            safe_last = current             # yahan tak sab sahi se process ho chuka
+            advancing = True
             temp.CANCEL = False
             total_messages = lst_msg_id
             total_fetch = lst_msg_id - current
-            if total_messages <= 0:
+            if total_fetch <= 0:
                 await msg.edit(
-                    "🚫 No Messages To Index.",
+                    "✅ Koi nayi file nahi hai, sab pehle se index hai.",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Close', callback_data='close_data')]])
                 )
                 return
-            batches = ceil(total_messages / BATCH_SIZE)
+            batches = ceil(total_fetch / BATCH_SIZE)
             batch_times = []
             await msg.edit(
                 f"📊 Indexing Starting......\n"
@@ -273,6 +314,7 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
                 except Exception as e:
                     errors += len(message_ids)
                     current += len(message_ids)
+                    advancing = False       # ye batch fail hua, progress isko paar nahi karegi
                     continue
                 save_tasks = []
                 for message in messages:
@@ -302,19 +344,24 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
                 for result in results:
                     if isinstance(result, Exception):
                         errors += 1
+                        advancing = False
                     else:
                         ok, code = result
                         if ok:
                             total_files += 1
                         elif code == 0:
                             duplicate += 1
-                        elif code == 2:
+                        elif code in (2, 3):
                             errors += 1
+                            advancing = False
+                if advancing:
+                    safe_last = current
+                    await set_last_indexed(chat, safe_last)
                 batch_time = time.time() - batch_start
                 batch_times.append(batch_time)
                 elapsed = time.time() - start_time
-                progress = current - temp.CURRENT
-                percentage = (progress / total_fetch) * 100
+                progress = current - start_point
+                percentage = min((progress / total_fetch) * 100, 100)
                 avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 1
                 eta = (total_fetch - progress) / BATCH_SIZE * avg_batch_time
                 progress_bar = get_progress_bar(int(percentage))
@@ -352,5 +399,6 @@ async def index_files_to_db(lst_msg_id, chat, msg, bot):
                 f"❌ Error: <code>{e}</code>",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('Close', callback_data='close_data')]])
             )
+ 
  
  
