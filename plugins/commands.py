@@ -213,7 +213,7 @@ async def start(client, message):
             ),
             InlineKeyboardButton(
                 '👥 ᴊᴏɪɴ ɢʀᴏᴜᴘ 👥',
-                url='https://t.me/english_chatting_group18'
+                url='https://t.me/+xfk1QS-y50RmOTc1'
             )
         ],[
             InlineKeyboardButton(
